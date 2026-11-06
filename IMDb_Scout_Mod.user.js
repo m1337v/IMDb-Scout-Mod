@@ -6808,10 +6808,28 @@ function listRowControls(element) {
   };
 }
 
-function queueSiteRequest(element, site, options) {
+function queueSiteRequest(element, site, options, scout_tick) {
   const configuredRate = 'rateLimit' in site ? site.rateLimit : 200;
   const rate = !onSearchPage || configuredRate > 1000 ? configuredRate : configuredRate * 4;
-  siteRequestQueue.enqueue(options, {
+  // maybeAddLink has already rejected unresolved metadata placeholders before a
+  // request reaches this point. Title pages can therefore expose a usable link
+  // while this queued request waits for a queue slot or a provider response.
+  if (!onSearchPage) { showPendingTitleLink(site, scout_tick); }
+  const terminalOptions = {};
+  ['onload', 'onerror', 'onabort', 'ontimeout'].forEach(function(event) {
+    const callback = options[event];
+    terminalOptions[event] = function(response) {
+      try {
+        return callback?.(response);
+      } finally {
+        // addLink consumes a pending entry when it renders a final state. If a
+        // missing result is hidden, it does not call addLink, so clean up here.
+        discardPendingTitleLink(site);
+      }
+    };
+  });
+  const requestOptions = { ...options, ...terminalOptions };
+  siteRequestQueue.enqueue(requestOptions, {
     ...listRowControls(element),
     interval: rate,
     throttleKey: options.url.split('/')[2] + '_lastLoaded'
@@ -7221,53 +7239,179 @@ function getFavicon(site, hide_on_err) {
 //    Add search links to an element
 //==============================================================================
 
-function addLink(elem, site, state, scout_tick) {
+const pendingTitleLinks = new WeakMap();
+let titlePostFormSequence = 0;
+const specialGetButtonTitles = new Set([
+  'TorSyndikat',
+  'TorSyndikat-Req',
+  'TorSyndikat-Produkt',
+  'TBD',
+  'TurkSeed',
+  'WoT',
+  'WoT (TV)'
+]);
+
+function createSiteLink(site, scout_tick) {
   const target = ('goToUrl' in site) ? site.goToUrl : site.searchUrl;
+  let link = $('<a />').attr('href', target).attr('target', '_blank').attr('rel', 'noreferrer');
+  if (!('mPOST' in site)) { return link; }
+
+  // List rows retain their scout tick. Title-page links have no tick, so give
+  // each created POST form a page-local suffix instead of colliding on
+  // "-form-undefined" while several checks are pending.
+  const form_tick = scout_tick === undefined ? 'title-' + (++titlePostFormSequence) : scout_tick;
+  let form_name = (site['TV']) ? site['name'] + '-TV-form-' + form_tick : site['name'] + '-form-' + form_tick;
+  form_name = form_name.replace(/\s|\.|\(|\)/g, '-');
+  link = $('<a />').attr('href', new URL(target).origin).attr('onclick', "document.getElementById('" + form_name + "').submit(); return false;").attr('target', '_blank').attr('rel', 'noreferrer');
+
+  const post_data = site.mPOST;
+  let data = post_data.match('{') ? post_data.replace(/\+/g, ' ') : '{key:"' + post_data.replace(/&/g, '"},{key:"').replace(/=/g, '",value:"').replace(/\+/g, ' ') + '"}';
+  const addform = $('<form></form>').attr({
+    'id': form_name,
+    'action': target,
+    'method': 'post',
+    'style': 'display: none;',
+    'target': '_blank',
+    'rel': 'noreferrer'
+  });
+
+  if (data.startsWith('{key:')) {
+    const dataArray = (new Function('return [' + data + '];'))();
+    dataArray.forEach(function(item) {
+      addform.append($('<input>').attr({'type': 'text', 'name': item.key, 'value': item.value}));
+    });
+  } else {
+    data = JSON.parse(data);
+    for (const name in data) {
+      addform.append($('<input>').attr({'type': 'text', 'name': name, 'value': data[name]}));
+    }
+  }
+  $('body').append(addform);
+  link.data('imdbscout-post-form', addform);
+  return link;
+}
+
+function specialGetButtonTitle(site) {
+  return site['TV'] ? site['name'] + ' (TV)' : site['name'];
+}
+
+function bindSpecialGetButton(link, title) {
+  const button = $(link);
+  if (!specialGetButtonTitles.has(title)) { return; }
+  const savedDestination = button.attr('data-imdbscout-original-destination');
+  const destination = savedDestination || button.attr('href');
+  // Do not turn a previously rewritten javascript URL into the destination.
+  if (!destination || destination === 'javascript: void(0)') { return; }
+  if (!savedDestination) { button.attr('data-imdbscout-original-destination', destination); }
+  button.attr('href', 'javascript: void(0)').removeAttr('target');
+  button.off('click.imdbScoutOpenInTab').on('click.imdbScoutOpenInTab', function(event) {
+    event.preventDefault();
+    GM.openInTab($(this).attr('data-imdbscout-original-destination'));
+  });
+}
+
+function bindSpecialGetButtonForSite(link, site) {
+  if (getPageSetting('use_mod_icons') && !('mPOST' in site)) {
+    bindSpecialGetButton(link, specialGetButtonTitle(site));
+  }
+}
+
+function pendingTitleBar(site) {
+  if (site['inSecondSearchBar']) {
+    return {header: getLinkAreaSecond(), id: 'imdbscoutsecondbar_checking', primary: false};
+  }
+  if (site['inThirdSearchBar']) {
+    return {header: getLinkAreaThird(), id: 'imdbscoutthirdbar_checking', primary: false};
+  }
+  return {header: getLinkArea(), id: 'imdbscout_checking', primary: true};
+}
+
+function pendingTitleContainer(site) {
+  const bar = pendingTitleBar(site);
+  let container = $('#' + bar.id);
+  if (!container.length) {
+    container = $(GM_config.get('one_line') ? '<span />' : '<div />').attr('id', bar.id).addClass('imdbscout_checking');
+    if (!GM_config.get('one_line')) {
+      container.append($('<span>Checking: </span>').css({
+        'textTransform': 'capitalize',
+        'min-width': '100px',
+        'display': 'inline-block'
+      }));
+    }
+    bar.header.append(container);
+  }
+  return {container: container, primary: bar.primary};
+}
+
+function removePendingTitlePresentation(pending, keepLink) {
+  if (keepLink) {
+    pending.link.detach();
+  } else {
+    pending.link.remove();
+  }
+  if (pending.separator.parentNode) { pending.separator.parentNode.removeChild(pending.separator); }
+  if (!pending.container.find('a[data-imdbscout-pending-link]').length) { pending.container.remove(); }
+}
+
+function showPendingTitleLink(site, scout_tick) {
+  if (pendingTitleLinks.has(site)) { return; }
+  const bar = pendingTitleContainer(site);
+  const link = createSiteLink(site, scout_tick);
+  link.attr({'aria-busy': 'true', 'title': 'Checking availability', 'data-imdbscout-pending-link': 'true'}).css('opacity', '0.6');
+  if (getPageSetting('use_mod_icons')) {
+    const icon = getFavicon(site).attr('title', 'Checking availability').css({
+      'border-width': GM_config.get('iconsborder_size'),
+      'border-style': 'solid',
+      'border-radius': '2px',
+      'border-color': 'rgb(135,135,135)',
+      'margin': '1px 0px 2px',
+      'opacity': '0.65'
+    });
+    link.append(icon);
+  } else {
+    link.text(site['name']).css('color', 'rgb(150,150,150)');
+  }
+  const separator = document.createTextNode(' ');
+  bar.container.append(link).append(separator);
+  pendingTitleLinks.set(site, {
+    link: link,
+    separator: separator,
+    container: bar.container,
+    primary: bar.primary,
+    postForm: link.data('imdbscout-post-form')
+  });
+  bindSpecialGetButtonForSite(link, site);
+}
+
+function takePendingTitleLink(site) {
+  const pending = pendingTitleLinks.get(site);
+  if (!pending) { return null; }
+  pendingTitleLinks.delete(site);
+  removePendingTitlePresentation(pending, true);
+  return pending.link.removeAttr('aria-busy').removeAttr('title').removeAttr('data-imdbscout-pending-link').css({'opacity': '', 'color': ''});
+}
+
+function discardPendingTitleLink(site) {
+  const pending = pendingTitleLinks.get(site);
+  if (!pending) { return; }
+  pendingTitleLinks.delete(site);
+  removePendingTitlePresentation(pending, false);
+  // This exact form was created solely for the pending anchor. A hidden
+  // missing result has no final link to reuse it, so do not leave it behind.
+  pending.postForm?.remove();
+  // Normally addLink reaches the sorter. A hidden missing result has no final
+  // link, but still represents a completed first-bar site.
+  if (pending.primary) { iconSorterLauncher(site); }
+}
+
+function addLink(elem, site, state, scout_tick) {
   // State should always be one of the values defined in valid_states.
   if ($.inArray(state, valid_states) < 0) {
     console.log("❌ Unknown state: " + state);
   }
 
-  var link = $('<a />').attr('href', target).attr('target', '_blank').attr('rel', 'noreferrer');
-  // Link and add Form element for POST method.
-  if ('mPOST' in site) {
-    var form_name = (site['TV']) ? site['name'] + '-TV-form-' + scout_tick : site['name'] + '-form-' + scout_tick;
-        form_name = form_name.replace(/\s|\.|\(|\)/g, '-');
-    var placebo_url = new URL(target).origin;
-    link = $('<a />').attr('href', placebo_url).attr('onclick', "document.getElementById('"+form_name+"').submit(); return false;").attr('target', '_blank').attr('rel', 'noreferrer');
-
-    const post_data = site.mPOST;
-    var data = (post_data.match('{')) ? post_data.replace(/\+/g, ' ') : '{key:"' + post_data.replace(/&/g, '"},{key:"').replace(/=/g, '",value:"').replace(/\+/g, ' ') + '"}';
-    var addform = $('<form></form>');
-        addform.attr('id', form_name);
-        addform.attr('action', target);
-        addform.attr('method', 'post');
-        addform.attr('style', 'display: none;');
-        addform.attr('target', '_blank');
-        addform.attr('rel', 'noreferrer');
-
-    if (data.startsWith('{key:')) {
-      const dataArray = (new Function("return [" +data+ "];")());
-      dataArray.forEach(function (item, index) {
-        let addinput = $("<input>");
-            addinput.attr('type', 'text');
-            addinput.attr('name', item.key);
-            addinput.attr('value', item.value);
-        addform.append(addinput);
-        $('body').append(addform);
-      });
-    } else {
-      data = JSON.parse(data);
-      for (const name in data) {
-        let addinput = $("<input>");
-            addinput.attr('type', 'text');
-            addinput.attr('name', name);
-            addinput.attr('value', data[name]);
-        addform.append(addinput);
-        $('body').append(addform);
-     }
-    }
-  }
+  var link = takePendingTitleLink(site) || createSiteLink(site, scout_tick);
+  link.empty();
   // Icon/Text appearance.
   let icon;
   let border_width = GM_config.get('iconsborder_size');
@@ -7357,73 +7501,9 @@ function addLink(elem, site, state, scout_tick) {
     $('#imdbscout3_' + state + scout_tick).append(link);
   }
 
-  if (onSearchPage) {
-    // Hack: Convert GET link to button to deal with same-origin problem (icons mode only).
-    // Title pages bind these buttons after sorting completes (iconToButtonHack).
-    if (site['name'] == "TorSyndikat") {
-      const button = $('span[id*='+ scout_tick +']').find('img[title="TorSyndikat"]').parent();
-      const link = button.attr('href');
-            button.prop("href", "javascript: void(0)");
-            button.removeAttr("target");
-      button.click(function() {
-        GM.openInTab(link);
-      });
-    }
-    if (site['name'] == "TorSyndikat-Req") {
-      const button = $('span[id*='+ scout_tick +']').find('img[title="TorSyndikat-Req"]').parent();
-      const link = button.attr('href');
-            button.prop("href", "javascript: void(0)");
-            button.removeAttr("target");
-      button.click(function() {
-        GM.openInTab(link);
-      });
-    }
-    if (site['name'] == "TorSyndikat-Produkt") {
-      const button = $('span[id*='+ scout_tick +']').find('img[title="TorSyndikat-Produkt"]').parent();
-      const link = button.attr('href');
-            button.prop("href", "javascript: void(0)");
-            button.removeAttr("target");
-      button.click(function() {
-        GM.openInTab(link);
-      });
-    }
-    if (site['name'] == "TBD") {
-      const button = $('span[id*='+ scout_tick +']').find('img[title="TBD"]').parent();
-      const link = button.attr('href');
-            button.prop("href", "javascript: void(0)");
-            button.removeAttr("target");
-      button.click(function() {
-        GM.openInTab(link);
-      });
-    }
-    if (site['name'] == "TurkSeed") {
-      const button = $('span[id*='+ scout_tick +']').find('img[title="TurkSeed"]').parent();
-      const link = button.attr('href');
-            button.prop("href", "javascript: void(0)");
-            button.removeAttr("target");
-      button.click(function() {
-        GM.openInTab(link);
-      });
-    }
-    if (site['name'] == "WoT") {
-      const button = $('span[id*='+ scout_tick +']').find('img[title="WoT"]').parent();
-      const link = button.attr('href');
-            button.prop("href", "javascript: void(0)");
-            button.removeAttr("target");
-      button.click(function() {
-        GM.openInTab(link);
-      });
-    }
-    if (site['name'] == "WoT") {
-      const button = $('span[id*='+ scout_tick +']').find('img[title="WoT (TV)"]').parent();
-      const link = button.attr('href');
-            button.prop("href", "javascript: void(0)");
-            button.removeAttr("target");
-      button.click(function() {
-        GM.openInTab(link);
-      });
-    }
-  }
+  // These providers must be opened through GM on every surface, including
+  // while their title-page availability request is still in flight.
+  bindSpecialGetButtonForSite(link, site);
   // Hack: Same-origin problem with POST, so remove 'onclick' form (icons mode only).
   // SFP dead, left for example
 //   if (site['name'] == "SFP-Req") {
@@ -7439,69 +7519,11 @@ function addLink(elem, site, state, scout_tick) {
 }
 
 function iconToButtonHack() {
-  if ($('img[title="TorSyndikat"]').length) {
-    const button = $('img[title="TorSyndikat"]').parent();
-    const link = button.attr('href');
-          button.prop("href", "javascript: void(0)");
-          button.removeAttr("target");
-    button.click(function() {
-      GM.openInTab(link);
+  specialGetButtonTitles.forEach(function(title) {
+    $('img[title="' + title + '"]').parent().each(function() {
+      bindSpecialGetButton(this, title);
     });
-  }
-  if ($('img[title="TorSyndikat-Req"]').length) {
-    const button = $('img[title="TorSyndikat-Req"]').parent();
-    const link = button.attr('href');
-          button.prop("href", "javascript: void(0)");
-          button.removeAttr("target");
-    button.click(function() {
-      GM.openInTab(link);
-    });
-  }
-  if ($('img[title="TorSyndikat-Produkt"]').length) {
-    const button = $('img[title="TorSyndikat-Produkt"]').parent();
-    const link = button.attr('href');
-          button.prop("href", "javascript: void(0)");
-          button.removeAttr("target");
-    button.click(function() {
-      GM.openInTab(link);
-    });
-  }
-  if ($('img[title="TBD"]').length) {
-    const button = $('img[title="TBD"]').parent();
-    const link = button.attr('href');
-          button.prop("href", "javascript: void(0)");
-          button.removeAttr("target");
-    button.click(function() {
-      GM.openInTab(link);
-    });
-  }
-  if ($('img[title="TurkSeed"]').length) {
-    const button = $('img[title="TurkSeed"]').parent();
-    const link = button.attr('href');
-          button.prop("href", "javascript: void(0)");
-          button.removeAttr("target");
-    button.click(function() {
-      GM.openInTab(link);
-    });
-  }
-  if ($('img[title="WoT"]').length) {
-    const button = $('img[title="WoT"]').parent();
-    const link = button.attr('href');
-          button.prop("href", "javascript: void(0)");
-          button.removeAttr("target");
-    button.click(function() {
-      GM.openInTab(link);
-    });
-  }
-  if ($('img[title="WoT (TV)"]').length) {
-    const button = $('img[title="WoT (TV)"]').parent();
-    const link = button.attr('href');
-          button.prop("href", "javascript: void(0)");
-          button.removeAttr("target");
-    button.click(function() {
-      GM.openInTab(link);
-    });
-  }
+  });
 }
 
 //==============================================================================
@@ -7577,7 +7599,7 @@ async function maybeAddLink(elem, site, scout_tick) {
         addLink(elem, site, 'error', scout_tick);
         console.log("❌ IMDb Scout Mod (POST-Request timed out). Site: " +site_name);
       }
-    });
+    }, scout_tick);
     return;
   }
   // Request header tweaks
@@ -7656,7 +7678,7 @@ async function maybeAddLink(elem, site, scout_tick) {
       addLink(elem, site, 'error', scout_tick);
       console.log("❌ IMDb Scout Mod (GET-Request timed out). Site: " +site_name);
     }
-  });
+  }, scout_tick);
 }
 
 //==============================================================================
@@ -8130,24 +8152,71 @@ function performSearchSecondPart(elem, link, movie_id, showsites, scout_tick) {
 //    Title page code
 //==============================================================================
 
-function performPage() {
-  const movie_id = document.URL.match(/\/tt([0-9]+)/)[1].trim('tt');
+function isValidTitlePageData(body, movie_id) {
+  return Boolean(body && typeof body === 'object' &&
+    !('errors' in body) && !('error' in body) &&
+    body.data?.title?.id === 'tt' + movie_id);
+}
+
+const titlePageRequests = new Map();
+const prefetchedTitleRequests = new Map();
+
+function getTitlePageResponse(movie_id) {
+  if (titlePageRequests.has(movie_id)) { return titlePageRequests.get(movie_id); }
   const query = { query: `query { title(id: "tt${movie_id}") { id titleText { text isOriginalTitle } originalTitleText { text } releaseYear { year } titleGenres { genres { genre { genreId } } } titleType { id } series { displayableEpisodeNumber { displayableSeason { text } episodeNumber { text } } series { id } } } }` };
 
-  GM.xmlHttpRequest({
-    method: "POST",
-    timeout: 10000,
-    url:     "https://api.graphql.imdb.com",
-    data:    JSON.stringify(query),
-    headers: {
-      'Content-Type': 'application/json',
-      'x-imdb-client-name': 'imdb-web-next-localized',
-      'x-imdb-user-country': 'US'
-    },
+  // Store the promise before dispatch, even with a synchronous manager callback.
+  const pending = Promise.resolve().then(() => new Promise(resolve => {
+    try {
+      imdbRequestQueue.enqueue({
+        method: 'POST',
+        timeout: 10000,
+        url: 'https://api.graphql.imdb.com',
+        data: JSON.stringify(query),
+        headers: {
+          'Content-Type': 'application/json',
+          'x-imdb-client-name': 'imdb-web-next-localized',
+          'x-imdb-user-country': 'US'
+        },
+        onload: response => resolve({ event: 'onload', response: response }),
+        onerror: response => resolve({ event: 'onerror', response: response }),
+        onabort: response => resolve({ event: 'onabort', response: response }),
+        ontimeout: response => resolve({ event: 'ontimeout', response: response })
+      }, { interval: 0, throttleKey: 'imdbscout_title_request_lastLoaded' });
+    } catch (error) {
+      resolve({ event: 'onerror', response: error });
+    }
+  })).then(result => {
+    let valid = false;
+    if (result.event === 'onload' && result.response?.status === 200) {
+      try {
+        const body = JSON.parse(result.response.responseText);
+        valid = isValidTitlePageData(body, movie_id);
+      } catch (error) { /* Invalid payloads must remain retriable. */ }
+    }
+    if (!valid) { titlePageRequests.delete(movie_id); }
+    return { ...result, valid: valid };
+  });
+  titlePageRequests.set(movie_id, pending);
+  return pending;
+}
+
+function prefetchTitlePage() {
+  const movie_id = document.URL.match(/\/title\/tt(\d+)/)?.[1];
+  if (onSearchPage || traktCodePage || !movie_id || GM_config.get('loadmod_on_start_movie') !== true) { return; }
+  if (document.documentElement?.innerHTML.includes('gokuProps')) { return; }
+  // The redirect checks above startup have already returned when necessary.
+  // Prefetch stays silent; performPage handles errors only when links are loaded.
+  prefetchedTitleRequests.set(movie_id, getTitlePageResponse(movie_id));
+}
+
+function performPage() {
+  const movie_id = document.URL.match(/\/tt([0-9]+)/)[1].trim('tt');
+  const callbacks = {
     onload: function(response) {
       if (response.status == 200) {
         const body = JSON.parse(response.responseText);
-        if ("errors" in body || "error" in body) {
+        if (!isValidTitlePageData(body, movie_id)) {
           console.log("❌ IMDb Scout Mod (performPage): Error in response.");
           GM.notification("Error in response.", "IMDb Scout Mod (performPage)");
           return;
@@ -8226,6 +8295,20 @@ function performPage() {
       console.log("❌ IMDb Scout Mod (performPage): Request timed out.");
       GM.notification("Request timed out.", "IMDb Scout Mod (performPage)");
     }
+  };
+  const request = getTitlePageResponse(movie_id);
+  const usedPrefetch = prefetchedTitleRequests.get(movie_id) === request;
+  request.then(function(result) {
+    if (document.URL.match(/\/title\/tt(\d+)/)?.[1] !== movie_id) { return null; }
+    // A speculative request can fail before page cookies have settled. Retry
+    // once at normal startup; a manual request keeps its single-attempt behavior.
+    return usedPrefetch && !result.valid ? getTitlePageResponse(movie_id) : result;
+  }).then(function(result) {
+    if (!result || document.URL.match(/\/title\/tt(\d+)/)?.[1] !== movie_id) { return; }
+    callbacks[result.event]?.(result.response);
+  }).catch(function(error) {
+    console.log('❌ IMDb Scout Mod (performPage): Invalid title response.', error);
+    GM.notification('Error in response.', 'IMDb Scout Mod (performPage)');
   });
 }
 
@@ -12792,6 +12875,8 @@ function startIMDbScout() {
     displayButton();
   }
 }
+
+prefetchTitlePage();
 
 if (onReferencePage) {
   console.log("✅ IMDb Scout Mod (Start): Starting Reference page: " + location.href);
