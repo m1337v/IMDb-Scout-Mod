@@ -6660,6 +6660,165 @@ var special_buttons = [
 var icon_sites = icon_sites_main.concat(special_buttons);
 
 //==============================================================================
+//    Bound concurrent requests without changing host rate limits
+//==============================================================================
+
+function createRequestQueue(maxActive, maxPerHost) {
+  let pending = [];
+  let active = 0;
+  let timer;
+  let pumping = false;
+  let paused = false;
+  const activeByHost = new Map();
+
+  function pump() {
+    if (paused || pumping) { return; }
+    pumping = true;
+    clearTimeout(timer);
+    timer = undefined;
+    try {
+      pending = pending.filter(job => !job.cancelled());
+      while (active < maxActive) {
+        let selected = -1;
+        let bestPriority = Infinity;
+        let nextDelay = Infinity;
+        const now = Date.now();
+
+        for (let index = 0; index < pending.length; index++) {
+          const job = pending[index];
+          if (!job.ready() || (activeByHost.get(job.host) || 0) >= maxPerHost) { continue; }
+          const lastStart = Number(window.localStorage[job.throttleKey]) || 0;
+          const delay = job.interval - (now - lastStart);
+          if (delay > 0) {
+            nextDelay = Math.min(nextDelay, delay);
+            continue;
+          }
+          const priority = job.priority();
+          if (priority < bestPriority) {
+            selected = index;
+            bestPriority = priority;
+          }
+        }
+
+        if (selected === -1) {
+          if (Number.isFinite(nextDelay)) {
+            timer = setTimeout(pump, Math.max(1, nextDelay));
+          }
+          break;
+        }
+
+        const job = pending.splice(selected, 1)[0];
+        window.localStorage[job.throttleKey] = Date.now();
+        active++;
+        activeByHost.set(job.host, (activeByHost.get(job.host) || 0) + 1);
+        dispatch(job);
+      }
+    } finally {
+      pumping = false;
+    }
+  }
+
+  function dispatch(job) {
+    let settled = false;
+    let request;
+    let deadline;
+
+    function finish(event, response) {
+      if (settled) { return; }
+      settled = true;
+      clearTimeout(deadline);
+      try {
+        if (!job.cancelled()) { job.options[event]?.(response); }
+      } catch (error) {
+        console.error('❌ IMDb Scout Mod (Request callback):', error);
+      } finally {
+        active--;
+        activeByHost.set(job.host, activeByHost.get(job.host) - 1);
+        pump();
+      }
+    }
+
+    function timedOut(response) {
+      if (settled) { return; }
+      finish('ontimeout', response);
+      try { request?.abort?.(); } catch (error) { /* Already settled. */ }
+    }
+
+    try {
+      job.start();
+      if (job.options.timeout > 0) {
+        deadline = setTimeout(timedOut, job.options.timeout);
+      }
+      request = GM.xmlHttpRequest({
+        ...job.options,
+        onload: response => finish('onload', response),
+        onerror: response => finish('onerror', response),
+        onabort: response => finish('onabort', response),
+        ontimeout: timedOut
+      });
+      if (request && typeof request.catch === 'function') {
+        request.catch(response => finish('onerror', response));
+      }
+    } catch (error) {
+      finish('onerror', error);
+    }
+  }
+
+  function enqueue(options, controls = {}) {
+    const host = new URL(options.url).host;
+    pending.push({
+      options: options,
+      host: host,
+      interval: controls.interval || 0,
+      throttleKey: controls.throttleKey || host + '_lastLoaded',
+      ready: controls.ready || (() => true),
+      cancelled: controls.cancelled || (() => false),
+      priority: controls.priority || (() => 0),
+      start: controls.start || (() => {})
+    });
+    pump();
+  }
+
+  // A back/forward-cache page can resume its existing queue. Do not abort
+  // running requests just because the user scrolls or temporarily leaves it.
+  window.addEventListener('pagehide', function() {
+    paused = true;
+    clearTimeout(timer);
+  });
+  window.addEventListener('pageshow', function() {
+    paused = false;
+    pump();
+  });
+
+  return { enqueue: enqueue, pump: pump };
+}
+
+const siteRequestQueue = createRequestQueue(8, 2);
+const imdbRequestQueue = createRequestQueue(2, 2);
+const listRowStates = new WeakMap();
+let listSearchStarted = false;
+
+function listRowControls(element) {
+  const row = element?.nodeType ? element : element?.[0];
+  const state = onSearchPage && row ? listRowStates.get(row) : null;
+  return {
+    ready: () => !state || state.nearVisible,
+    cancelled: () => Boolean(onSearchPage && row &&
+      (!row.isConnected || (state && listRowStates.get(row) !== state)))
+  };
+}
+
+function queueSiteRequest(element, site, options) {
+  const configuredRate = 'rateLimit' in site ? site.rateLimit : 200;
+  const rate = !onSearchPage || configuredRate > 1000 ? configuredRate : configuredRate * 4;
+  siteRequestQueue.enqueue(options, {
+    ...listRowControls(element),
+    interval: rate,
+    throttleKey: options.url.split('/')[2] + '_lastLoaded'
+  });
+}
+
+//==============================================================================
 //    Replace Search URL parameters
 //==============================================================================
 
@@ -6781,473 +6940,235 @@ function getCustomSites() {
 //    Convert IMDb ID to TVDb/TVmaze/TMDb/Douban ID
 //==============================================================================
 
-function getTVDbID(movie_id) {
-  return new Promise(resolve => {
-    GM.xmlHttpRequest({
-      method: "GET",
-      timeout: 10000,
-      url:    "https://thetvdb.com/api/GetSeriesByRemoteID.php?imdbid=tt" + movie_id,
-      onload: function(response) {
-        if (String(response.responseText).match("seriesid")) {
-          response.responseXML = new DOMParser().parseFromString(response.responseText, "application/xml");
-          const xmldata = response.responseXML;
-          const tvdb_id = xmldata.getElementsByTagName("seriesid")[0].childNodes[0].nodeValue;
-          resolve(tvdb_id);
-        } else {
-          const tvdb_id = "00000000";
-          resolve(tvdb_id);
-        }
-      },
-      onerror: function() {
-        GM.notification("Request Error.", "IMDb Scout Mod (getTVDbID)");
-        console.log("❌ IMDb Scout Mod (getTVDbID): Request Error.");
-        resolve("00000000");
-      },
-      onabort: function() {
-        console.log("❌ IMDb Scout Mod (getTVDbID): Request aborted.");
-        resolve("00000000");
-      },
-      ontimeout: function() {
-        console.log("❌ IMDb Scout Mod (getTVDbID): Request timed out.");
-        resolve("00000000");
+// Share pending and successful metadata lookups for this page only. Failed
+// requests are removed so a later search can retry instead of caching an outage.
+const metadataRequests = new Map();
+
+function requestMetadata(name, options, parseResponse) {
+  const key = JSON.stringify([options.url, options.headers || {}]);
+  if (metadataRequests.has(key)) {
+    return metadataRequests.get(key);
+  }
+
+  // Defer transport startup until the promise is in the cache, including when a
+  // userscript manager invokes a callback synchronously.
+  const pending = Promise.resolve().then(() => new Promise(resolve => {
+    let settled = false;
+    let request;
+    let deadline;
+    const finish = function(value, error) {
+      if (settled) { return; }
+      settled = true;
+      clearTimeout(deadline);
+      if (error === 'Request Error.') {
+        try { GM.notification('Request Error.', 'IMDb Scout Mod (' + name + ')'); } catch (error) {}
       }
-    });
-  });
-}
-
-function getTVmazeID(movie_id) {
-  return new Promise(resolve => {
-    GM.xmlHttpRequest({
-      method: "GET",
-      timeout: 10000,
-      url:    "https://api.tvmaze.com/lookup/shows?imdb=tt" + movie_id,
-      onload: function(response) {
-        if (response.status >= 400) {
-          resolve("00000000");
-        } else {
-          const result = JSON.parse(response.responseText);
-          const tvmaze_id = result.id;
-          resolve(tvmaze_id);
-        }
-      },
-      onerror: function() {
-        GM.notification("Request Error.", "IMDb Scout Mod (getTVmazeID)");
-        console.log("❌ IMDb Scout Mod (getTVmazeID): Request Error.");
-        resolve("00000000");
-      },
-      onabort: function() {
-        console.log("❌ IMDb Scout Mod (getTVmazeID): Request Aborted.");
-        resolve("00000000");
-      },
-      ontimeout: function() {
-        console.log("❌ IMDb Scout Mod (getTVmazeID): Request Timeout.");
-        resolve("00000000");
+      if (error) {
+        console.log('❌ IMDb Scout Mod (' + name + '): ' + error);
       }
-    });
-  });
-}
-
-function getTMDbID(movie_id) {
-  return new Promise(resolve => {
-    GM.xmlHttpRequest({
-      method: "GET",
-      timeout: 10000,
-      url:    "https://api.themoviedb.org/3/find/tt" + movie_id + "?api_key=d12b33d3f4fb8736dc06f22560c4f8d4&external_source=imdb_id",
-      onload: function(response) {
-        const result = JSON.parse(response.responseText);
-        if (String(response.responseText).match('movie_results":\\[{')) {
-          const tmdb_id = result.movie_results[0].id;
-          resolve(tmdb_id);
-        } else if (String(response.responseText).match('tv_results":\\[{')) {
-          const tmdb_id = result.tv_results[0].id;
-          resolve(tmdb_id);
-        } else if (String(response.responseText).match('tv_episode_results":\\[{')) {
-          const tmdb_id = result.tv_episode_results[0].id;
-          resolve(tmdb_id);
-        } else {
-          const tmdb_id = "00000000";
-          resolve(tmdb_id);
-        }
-      },
-      onerror: function() {
-        GM.notification("Request Error.", "IMDb Scout Mod (getTMDbID)");
-        console.log("❌ IMDb Scout Mod (getTMDbID): Request Error.");
-        resolve("00000000");
-      },
-      onabort: function() {
-        console.log("❌ IMDb Scout Mod (getTMDbID): Request aborted.");
-        resolve("00000000");
-      },
-      ontimeout: function() {
-        console.log("❌ IMDb Scout Mod (getTMDbID): Request timed out.");
-        resolve("00000000");
-      }
-    });
-  });
-}
-
-function getTMDb_original_title(movie_id) {
-  return new Promise(resolve => {
-    GM.xmlHttpRequest({
-      method: "GET",
-      timeout: 10000,
-      url:    "https://api.themoviedb.org/3/find/tt" + movie_id + "?api_key=d12b33d3f4fb8736dc06f22560c4f8d4&external_source=imdb_id",
-      onload: function(response) {
-        const result = JSON.parse(response.responseText);
-        let org_title = "00000000";
-        let eng_title = "00000000";
-
-        if (String(response.responseText).match('movie_results":\\[{')) {
-          org_title = result.movie_results[0].original_title;
-          eng_title = result.movie_results[0].title;
-        } else if (String(response.responseText).match('tv_results":\\[{')) {
-          org_title = result.tv_results[0].original_name;
-          eng_title = result.tv_results[0].name;
-        } else if (String(response.responseText).match('tv_episode_results":\\[{')) {
-          org_title = result.tv_episode_results[0].name;
-          eng_title = org_title;
-        }
-        resolve([eng_title, org_title]);
-      },
-      onerror: function() {
-        GM.notification("Request Error.", "IMDb Scout Mod (getTMDb_original_title)");
-        console.log("❌ IMDb Scout Mod (getTMDb_original_title): Request Error.");
-        resolve("00000000");
-      },
-      onabort: function() {
-        console.log("❌ IMDb Scout Mod (getTMDb_original_title): Request aborted.");
-        resolve("00000000");
-      },
-      ontimeout: function() {
-        console.log("❌ IMDb Scout Mod (getTMDb_original_title): Request timed out.");
-        resolve("00000000");
-      }
-    });
-  });
-}
-
-function getDoubanID0(movie_id) {
-  console.log("IMDb Scout Mod (getDoubanID0): Started.");
-  return new Promise(resolve => {
-    GM.xmlHttpRequest({
-      method: "GET",
-      timeout: 8000,
-      url:    "https://www.douban.com/search?cat=1002&q=tt" + movie_id,
-      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:108.0) Gecko/20100101 Firefox/108.0" },
-      onload: function(response) {
-        const parser = new DOMParser();
-        const result = parser.parseFromString(response.responseText, "text/html");
-        if ($(result).find('[onclick*=' +movie_id+ ']').length) {
-          const x = $(result).find('[onclick*=' +movie_id+ ']').attr('href');
-          if (x.match(/subject%2F(\d+)/)) {
-            const y = x.match(/subject%2F(\d+)/)[1];
-            resolve(y);
-          } else {
-            resolve("00000000");
+      resolve(value);
+    };
+    const timedOut = function() {
+      if (settled) { return; }
+      finish(null, 'Request timed out.');
+      try { request?.abort?.(); } catch (error) { /* Already settled. */ }
+    };
+    deadline = setTimeout(timedOut, options.timeout);
+    try {
+      request = GM.xmlHttpRequest({
+        ...options,
+        method: 'GET',
+        onload: function(response) {
+          if (settled) { return; }
+          try {
+            if (!response || !(response.status >= 200 && response.status < 300) || !response.responseText) {
+              finish(null, 'Unsuccessful metadata response.');
+              return;
+            }
+            const value = parseResponse(response.responseText);
+            finish(value == null ? null : value);
+          } catch (error) {
+            finish(null, 'Invalid metadata response.');
           }
-        } else {
-          resolve("00000000");
-        }
-      },
-      onerror: function() {
-        GM.notification("Request Error.", "IMDb Scout Mod (getDoubanID0)");
-        console.log("❌ IMDb Scout Mod (getDoubanID0): Request Error.");
-        resolve("00000000");
-      },
-      onabort: function() {
-        console.log("❌ IMDb Scout Mod (getDoubanID0): Request Aborted.");
-        resolve("00000000");
-      },
-      ontimeout: function() {
-        console.log("❌ IMDb Scout Mod (getDoubanID0): Request Timeout.");
-        resolve("00000000");
+        },
+        onerror: function() { finish(null, 'Request Error.'); },
+        onabort: function() { finish(null, 'Request aborted.'); },
+        ontimeout: timedOut
+      });
+      // GM.xmlHttpRequest may also return a promise. Handle transport rejection
+      // even when the manager does not invoke one of the callbacks above.
+      if (request && typeof request.catch === 'function') {
+        request.catch(function() { finish(null, 'Request Error.'); });
       }
-    });
+    } catch (error) {
+      finish(null, 'Request Error.');
+    }
+  })).then(value => {
+    if (value === null) { metadataRequests.delete(key); }
+    return value;
+  });
+  metadataRequests.set(key, pending);
+  return pending;
+}
+
+function metadataID(value) {
+  if (typeof value !== 'string' && typeof value !== 'number') { return '00000000'; }
+  return /^(?!0+$)\d+$/.test(String(value)) ? value : '00000000';
+}
+
+async function getTVDbID(movie_id) {
+  const id = await requestMetadata('getTVDbID', {
+    timeout: 10000,
+    url: 'https://thetvdb.com/api/GetSeriesByRemoteID.php?imdbid=tt' + movie_id
+  }, function(text) {
+    const xml = new DOMParser().parseFromString(text, 'application/xml');
+    if (xml.getElementsByTagName('parsererror').length) { return null; }
+    const id = metadataID(xml.getElementsByTagName('seriesid')[0]?.textContent.trim());
+    return id === '00000000' ? null : id;
+  });
+  return id ?? '00000000';
+}
+
+async function getTVmazeID(movie_id) {
+  const id = await requestMetadata('getTVmazeID', {
+    timeout: 10000,
+    url: 'https://api.tvmaze.com/lookup/shows?imdb=tt' + movie_id
+  }, function(text) {
+    const id = metadataID(JSON.parse(text)?.id);
+    return id === '00000000' ? null : id;
+  });
+  return id ?? '00000000';
+}
+
+function getTMDbFindResult(movie_id) {
+  return requestMetadata('TMDb', {
+    timeout: 10000,
+    url: 'https://api.themoviedb.org/3/find/tt' + movie_id + '?api_key=d12b33d3f4fb8736dc06f22560c4f8d4&external_source=imdb_id'
+  }, function(text) {
+    const result = JSON.parse(text);
+    if (!result || !Array.isArray(result.movie_results) || !Array.isArray(result.tv_results) || !Array.isArray(result.tv_episode_results)) {
+      return null;
+    }
+    const entries = result.movie_results.concat(result.tv_results, result.tv_episode_results);
+    if (entries.some(entry => !entry || metadataID(entry.id) === '00000000')) { return null; }
+    return result;
   });
 }
 
-function getDoubanID1(movie_id) {
-  console.log("IMDb Scout Mod (getDoubanID1): Started.");
-  return new Promise(resolve => {
-    GM.xmlHttpRequest({
-      method: "GET",
-      timeout: 8000,
-      url:    "https://movie.douban.com/subject_search?search_text=tt" + movie_id,
-      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:108.0) Gecko/20100101 Firefox/108.0" },
-      onload: function(response) {
-        const result = String(response.responseText);
-        if (result.match(/subject\/(\d+)/)) {
-          const y = result.match(/subject\/(\d+)/)[1];
-          resolve(y);
-        } else {
-            resolve("00000000");
-        }
-      },
-      onerror: function() {
-        GM.notification("Request Error.", "IMDb Scout Mod (getDoubanID1)");
-        console.log("❌ IMDb Scout Mod (getDoubanID1): Request Error.");
-        resolve("00000000");
-      },
-      onabort: function() {
-        console.log("❌ IMDb Scout Mod (getDoubanID1): Request Aborted.");
-        resolve("00000000");
-      },
-      ontimeout: function() {
-        console.log("❌ IMDb Scout Mod (getDoubanID1): Request Timeout.");
-        resolve("00000000");
-      }
+async function getTMDbID(movie_id) {
+  const result = await getTMDbFindResult(movie_id);
+  const entry = result?.movie_results[0] || result?.tv_results[0] || result?.tv_episode_results[0];
+  return metadataID(entry?.id);
+}
+
+async function getTMDb_original_title(movie_id) {
+  const result = await getTMDbFindResult(movie_id);
+  let eng_title, org_title;
+  if (result?.movie_results.length) {
+    eng_title = result.movie_results[0]?.title;
+    org_title = result.movie_results[0]?.original_title;
+  } else if (result?.tv_results.length) {
+    eng_title = result.tv_results[0]?.name;
+    org_title = result.tv_results[0]?.original_name;
+  } else if (result?.tv_episode_results.length) {
+    eng_title = result.tv_episode_results[0]?.name;
+    org_title = eng_title;
+  }
+  // Return a fresh pair: callers append their own title fallbacks to this array.
+  return [eng_title, org_title].map(title => typeof title === 'string' && title.trim() ? title : '00000000');
+}
+
+const metadataHeaders = { 'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:108.0) Gecko/20100101 Firefox/108.0' };
+
+async function getDoubanID0(movie_id) {
+  const id = await requestMetadata('getDoubanID0', {
+    timeout: 8000,
+    url: 'https://www.douban.com/search?cat=1002&q=tt' + movie_id,
+    headers: metadataHeaders
+  }, function(text) {
+    const result = new DOMParser().parseFromString(text, 'text/html');
+    const href = $(result).find('[onclick*=' + movie_id + ']').attr('href') || '';
+    return href.match(/subject%2F(\d+)/)?.[1] || null;
+  });
+  return id ?? '00000000';
+}
+
+async function getDoubanID1(movie_id) {
+  const id = await requestMetadata('getDoubanID1', {
+    timeout: 8000,
+    url: 'https://movie.douban.com/subject_search?search_text=tt' + movie_id,
+    headers: metadataHeaders
+  }, text => text.match(/subject\/(\d+)/)?.[1] || null);
+  return id ?? '00000000';
+}
+
+function getWikidataBindings(name, url, timeout = 10000) {
+  return requestMetadata(name, { timeout: timeout, url: url, headers: metadataHeaders }, function(text) {
+    const result = JSON.parse(text);
+    const bindings = result?.results?.bindings;
+    if (!Array.isArray(bindings)) { return null; }
+    const invalid = bindings.some(function(row) {
+      if (!row || typeof row !== 'object' || Array.isArray(row)) { return true; }
+      return Object.values(row).some(cell => !cell || typeof cell.value !== 'string');
     });
+    return invalid ? null : bindings;
   });
 }
 
-function getDoubanID2(movie_id) {
-  console.log("IMDb Scout Mod (getDoubanID2): Started.");
-  return new Promise(resolve => {
-    GM.xmlHttpRequest({
-      method: "GET",
-      timeout: 8000,
-      url:    'https://query.wikidata.org/sparql?format=json&query=SELECT * WHERE {?s wdt:P345 "tt' +movie_id+ '". OPTIONAL { ?s wdt:P4529 ?Douban_film_ID. }}',
-      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:108.0) Gecko/20100101 Firefox/108.0" },
-      onload: function(response) {
-        const result = JSON.parse(response.responseText);
-        if (result.results.bindings[0] != undefined) {
-          if (result.results.bindings[0].Douban_film_ID != undefined) {
-            const douban_id = result.results.bindings[0].Douban_film_ID.value;
-            resolve(douban_id);
-          } else {
-            resolve("00000000");
-          }
-        } else {
-          const douban_id = "00000000";
-          resolve(douban_id);
-        }
-      },
-      onerror: function() {
-        GM.notification("Request Error.", "IMDb Scout Mod (getDoubanID2)");
-        console.log("❌ IMDb Scout Mod (getDoubanID2): Request Error.");
-        resolve("00000000");
-      },
-      onabort: function() {
-        console.log("❌ IMDb Scout Mod (getDoubanID2): Request Aborted.");
-        resolve("00000000");
-      },
-      ontimeout: function() {
-        console.log("❌ IMDb Scout Mod (getDoubanID2): Request Timeout.");
-        resolve("00000000");
-      }
-    });
-  });
+async function getDoubanID2(movie_id) {
+  const bindings = await getWikidataBindings('getDoubanID2',
+    'https://query.wikidata.org/sparql?format=json&query=SELECT * WHERE {?s wdt:P345 "tt' + movie_id + '". OPTIONAL { ?s wdt:P4529 ?Douban_film_ID. }}', 8000);
+  return metadataID(bindings?.[0]?.Douban_film_ID?.value);
 }
 
-function getDoubanID3(movie_id) {
-  console.log("IMDb Scout Mod (getDoubanID3): Started.");
-  return new Promise(resolve => {
-    GM.xmlHttpRequest({
-      method: "GET",
-      timeout: 10000,
-      url:    'https://www.google.com/search?q="tt' +movie_id+ '" site:https://movie.douban.com/subject&safe=off',
-      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:108.0) Gecko/20100101 Firefox/108.0" },
-      onload: function(response) {
-        const result = String(response.responseText);
-        if (result.match("movie.douban.com/subject/")) {
-          const x = result.split("movie.douban.com/subject/")[1];
-          const y = x.split("/")[0];
-          const douban_id = y;
-          resolve(douban_id);
-        } else {
-          const douban_id = "00000000";
-          resolve(douban_id);
-        }
-      },
-      onerror: function() {
-        GM.notification("Request Error.", "IMDb Scout Mod (getDoubanID3)");
-        console.log("❌ IMDb Scout Mod (getDoubanID3): Request Error.");
-        resolve("00000000");
-      },
-      onabort: function() {
-        console.log("❌ IMDb Scout Mod (getDoubanID3): Request Aborted.");
-        resolve("00000000");
-      },
-      ontimeout: function() {
-        console.log("❌ IMDb Scout Mod (getDoubanID3): Request Timeout.");
-        resolve("00000000");
-      }
-    });
-  });
+async function getDoubanID3(movie_id) {
+  const id = await requestMetadata('getDoubanID3', {
+    timeout: 10000,
+    url: 'https://www.google.com/search?q="tt' + movie_id + '" site:https://movie.douban.com/subject&safe=off',
+    headers: metadataHeaders
+  }, text => text.match(/movie\.douban\.com\/subject\/(\d+)(?:\/|[?"'&#<\s]|$)/)?.[1] || null);
+  return id ?? '00000000';
 }
 
-function getAllocineID(movie_id) {
-  console.log("IMDb Scout Mod (getAllocineID): Started.");
-  return new Promise(resolve => {
-    GM.xmlHttpRequest({
-      method: "GET",
-      timeout: 10000,
-      url:    'https://query.wikidata.org/sparql?format=json&query=SELECT * WHERE {?s wdt:P345 "tt' +movie_id+ '". OPTIONAL {?s wdt:P1265 ?AlloCin__film_ID.}  OPTIONAL {?s wdt:P1267 ?AlloCin__series_ID.}}',
-      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:108.0) Gecko/20100101 Firefox/108.0" },
-      onload: function(response) {
-        const result = JSON.parse(response.responseText);
-        if (result.results.bindings[0] != undefined) {
-          if (result.results.bindings[0].AlloCin__film_ID != undefined) {
-            GM.setValue("AllocineID_last_is_film", true);
-            const allocine_id = result.results.bindings[0].AlloCin__film_ID.value;
-            resolve(allocine_id);
-          } else if (result.results.bindings[0].AlloCin__series_ID != undefined) {
-            GM.setValue("AllocineID_last_is_film", false);
-            const allocine_id = result.results.bindings[0].AlloCin__series_ID.value;
-            resolve(allocine_id);
-          } else {
-            GM.setValue("AllocineID_last_is_film", "none");
-            const allocine_id = "00000000";
-            resolve(allocine_id);
-          }
-        }
-      },
-      onerror: function() {
-        GM.notification("Request Error.", "IMDb Scout Mod (getAllocineID)");
-        console.log("❌ IMDb Scout Mod (getAllocineID): Request Error.");
-        resolve("00000000");
-      },
-      onabort: function() {
-        console.log("❌ IMDb Scout Mod (getAllocineID): Request aborted.");
-        resolve("00000000");
-      },
-      ontimeout: function() {
-        console.log("❌ IMDb Scout Mod (getAllocineID): Request timed out.");
-        resolve("00000000");
-      }
-    });
-  });
+async function getAllocineID(movie_id) {
+  const bindings = await getWikidataBindings('getAllocineID',
+    'https://query.wikidata.org/sparql?format=json&query=SELECT * WHERE {?s wdt:P345 "tt' + movie_id + '". OPTIONAL {?s wdt:P1265 ?AlloCin__film_ID.}  OPTIONAL {?s wdt:P1267 ?AlloCin__series_ID.}}');
+  const film = metadataID(bindings?.[0]?.AlloCin__film_ID?.value);
+  const series = metadataID(bindings?.[0]?.AlloCin__series_ID?.value);
+  // Retain the existing caller contract even when the response comes from cache.
+  let isFilm = 'none';
+  if (film !== '00000000') {
+    isFilm = true;
+  } else if (series !== '00000000') {
+    isFilm = false;
+  }
+  GM.setValue('AllocineID_last_is_film', isFilm);
+  return film !== '00000000' ? film : series;
 }
 
-function getAnimeID(movie_id) {
-  console.log("IMDb Scout Mod (getAnimeID): Started.");
-  const url = 'https://query.wikidata.org/sparql?format=json&query=SELECT * WHERE {?s wdt:P345 "tt' +movie_id+ '". OPTIONAL {?s wdt:P4086 ?MyAnimeList_ID.}  OPTIONAL {?s wdt:P8729 ?AniList_ID.}}';
+async function getAnimeID(movie_id) {
+  const url = 'https://query.wikidata.org/sparql?format=json&query=SELECT * WHERE {?s wdt:P345 "tt' + movie_id + '". OPTIONAL {?s wdt:P4086 ?MyAnimeList_ID.}  OPTIONAL {?s wdt:P8729 ?AniList_ID.}}';
   $('.AnimeUserRatingUrl').attr('href', url);
-  return new Promise(resolve => {
-    GM.xmlHttpRequest({
-      method: "GET",
-      timeout: 10000,
-      url:     url,
-      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:108.0) Gecko/20100101 Firefox/108.0" },
-      onload: function(response) {
-        const result = JSON.parse(response.responseText);
-        let myanimelist_id = "00000000";
-        let anilist_id = "00000000";
-        if (result.results.bindings[0] != undefined) {
-          for (xx of result.results.bindings) {
-            if (xx.MyAnimeList_ID) {
-              myanimelist_id = xx.MyAnimeList_ID.value;
-              break;
-            }
-          }
-          for (yy of result.results.bindings) {
-            if (yy.AniList_ID) {
-              anilist_id = yy.AniList_ID.value;
-              break;
-            }
-          }
-        }
-        if (myanimelist_id == "00000000") {
-          console.log("IMDb Scout Mod (getAnimeID): MyAnimeList ID not found on Wikidata.");
-        }
-        if (anilist_id == "00000000") {
-          console.log("IMDb Scout Mod (getAnimeID): AniList ID not found on Wikidata.");
-        }
-        resolve([myanimelist_id, anilist_id]);
-      },
-      onerror: function() {
-        GM.notification("Request Error.", "IMDb Scout Mod (getAnimeID)");
-        console.log("❌ IMDb Scout Mod (getAnimeID): Request Error.");
-        resolve("00000000");
-      },
-      onabort: function() {
-        console.log("❌ IMDb Scout Mod (getAnimeID): Request aborted.");
-        resolve("00000000");
-      },
-      ontimeout: function() {
-        console.log("❌ IMDb Scout Mod (getAnimeID): Request timed out.");
-        resolve("00000000");
-      }
-    });
-  });
+  const bindings = await getWikidataBindings('getAnimeID', url);
+  return [
+    metadataID(bindings?.find(row => row?.MyAnimeList_ID)?.MyAnimeList_ID?.value),
+    metadataID(bindings?.find(row => row?.AniList_ID)?.AniList_ID?.value)
+  ];
 }
 
-function getMetacriticID1(movie_id) {
-  console.log("IMDb Scout Mod (getMetacriticID1): Started.");
-  return new Promise(resolve => {
-    GM.xmlHttpRequest({
-      method: "GET",
-      timeout: 10000,
-      url:    'https://query.wikidata.org/sparql?format=json&query=SELECT * WHERE {?s wdt:P345 "tt' +movie_id+ '". OPTIONAL { ?s wdt:P1712 ?Metacritic_ID. }}',
-      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:108.0) Gecko/20100101 Firefox/108.0" },
-      onload: function(response) {
-        const result = JSON.parse(response.responseText);
-        if (result.results.bindings[0] != undefined) {
-          if (result.results.bindings[0].Metacritic_ID != undefined) {
-            const metacritic_id = result.results.bindings[0].Metacritic_ID.value;
-            resolve(metacritic_id);
-          } else {
-            resolve("00000000");
-          }
-        } else {
-          const metacritic_id = "00000000";
-          resolve(metacritic_id);
-        }
-      },
-      onerror: function() {
-        GM.notification("Request Error.", "IMDb Scout Mod (getMetacriticID1)");
-        console.log("❌ IMDb Scout Mod (getMetacriticID1): Request Error.");
-        resolve("00000000");
-      },
-      onabort: function() {
-        console.log("❌ IMDb Scout Mod (getMetacriticID1): Request Aborted.");
-        resolve("00000000");
-      },
-      ontimeout: function() {
-        console.log("❌ IMDb Scout Mod (getMetacriticID1): Request Timeout.");
-        resolve("00000000");
-      }
-    });
-  });
+async function getMetacriticID1(movie_id) {
+  const bindings = await getWikidataBindings('getMetacriticID1',
+    'https://query.wikidata.org/sparql?format=json&query=SELECT * WHERE {?s wdt:P345 "tt' + movie_id + '". OPTIONAL { ?s wdt:P1712 ?Metacritic_ID. }}');
+  // Metacritic and Rotten Tomatoes identifiers are paths, not numeric IDs.
+  const id = bindings?.[0]?.Metacritic_ID?.value;
+  return typeof id === 'string' && id.trim() ? id : '00000000';
 }
 
-function getRottenID1(movie_id) {
-  console.log("IMDb Scout Mod (getRottenID1): Started.");
-  return new Promise(resolve => {
-    GM.xmlHttpRequest({
-      method: "GET",
-      timeout: 10000,
-      url:    'https://query.wikidata.org/sparql?format=json&query=SELECT * WHERE {?s wdt:P345 "tt' +movie_id+ '". OPTIONAL { ?s wdt:P1258 ?Rotten_Tomatoes_ID. }}',
-      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:108.0) Gecko/20100101 Firefox/108.0" },
-      onload: function(response) {
-        const result = JSON.parse(response.responseText);
-        if (result.results.bindings[0] != undefined) {
-          if (result.results.bindings[0].Rotten_Tomatoes_ID != undefined) {
-            const rotten_id = result.results.bindings[0].Rotten_Tomatoes_ID.value;
-            resolve(rotten_id);
-          } else {
-            resolve("00000000");
-          }
-        } else {
-          const rotten_id = "00000000";
-          resolve(rotten_id);
-        }
-      },
-      onerror: function() {
-        GM.notification("Request Error.", "IMDb Scout Mod (getRottenID1)");
-        console.log("❌ IMDb Scout Mod (getRottenID1): Request Error.");
-        resolve("00000000");
-      },
-      onabort: function() {
-        console.log("❌ IMDb Scout Mod (getRottenID1): Request Aborted.");
-        resolve("00000000");
-      },
-      ontimeout: function() {
-        console.log("❌ IMDb Scout Mod (getRottenID1): Request Timeout.");
-        resolve("00000000");
-      }
-    });
-  });
+async function getRottenID1(movie_id) {
+  const bindings = await getWikidataBindings('getRottenID1',
+    'https://query.wikidata.org/sparql?format=json&query=SELECT * WHERE {?s wdt:P345 "tt' + movie_id + '". OPTIONAL { ?s wdt:P1258 ?Rotten_Tomatoes_ID. }}');
+  const id = bindings?.[0]?.Rotten_Tomatoes_ID?.value;
+  return typeof id === 'string' && id.trim() ? id : '00000000';
 }
 
 //==============================================================================
@@ -7438,7 +7359,7 @@ function addLink(elem, site, state, scout_tick) {
 
   if (onSearchPage) {
     // Hack: Convert GET link to button to deal with same-origin problem (icons mode only).
-    // Sorting removes event, so on the title pages same hack will run at the end of the sorting (iconToButtonHack).
+    // Title pages bind these buttons after sorting completes (iconToButtonHack).
     if (site['name'] == "TorSyndikat") {
       const button = $('span[id*='+ scout_tick +']').find('img[title="TorSyndikat"]').parent();
       const link = button.attr('href');
@@ -7590,24 +7511,6 @@ function iconToButtonHack() {
 async function maybeAddLink(elem, site, scout_tick) {
   var search_url = site.searchUrl;
   var site_name = site.name;
-  // Connection rate limiter per domain.
-  var set_rate = ('rateLimit' in site) ? site['rateLimit'] : 200;
-  var rate     = (!onSearchPage) ? set_rate : (set_rate > 1000) ? set_rate : set_rate * 4;
-  var domain   = search_url.split('/')[2];
-  var now      = (new Date())*1;
-  var lastLoaded = window.localStorage[domain+'_lastLoaded'];
-  if (!lastLoaded) {
-    lastLoaded = now - 50000;
-  } else {
-    lastLoaded = parseInt(lastLoaded);
-  }
-  if (now - lastLoaded < rate) {
-    window.setTimeout(maybeAddLink.bind(undefined, elem, site, scout_tick), rate);
-    return;
-  } else {
-    window.localStorage[domain+'_lastLoaded'] = (new Date())*1;
-  }
-
   var success_match = ('positiveMatch' in site) ? site['positiveMatch'] : false;
 
   // Check tmdb/tvdb & ect conversion.
@@ -7624,7 +7527,7 @@ async function maybeAddLink(elem, site, scout_tick) {
 
   // Check for results with POST method.
   if ('mPOST' in site) {
-    GM.xmlHttpRequest({
+    queueSiteRequest(elem, site, {
       method: 'POST',
       timeout: parseInt(GM_config.get('timeout_ms')),
       url: search_url,
@@ -7704,7 +7607,7 @@ async function maybeAddLink(elem, site, scout_tick) {
   }
 
   // Check for results with GET method.
-  GM.xmlHttpRequest({
+  queueSiteRequest(elem, site, {
     method: 'GET',
     headers: reqHeader,
     timeout: parseInt(GM_config.get('timeout_ms')),
@@ -7761,6 +7664,8 @@ async function maybeAddLink(elem, site, scout_tick) {
 //==============================================================================
 
 function perform(elem, movie_id, movie_title, movie_title_orig, is_tv, is_movie, series_id, season_id, episode_id, movie_year, scout_tick) {
+  const rowControls = listRowControls(elem);
+  if (rowControls.cancelled()) { return; }
   var site_shown = false;
   $.each(sites, async function(index, site) {
     if (site['show']) {
@@ -7778,6 +7683,7 @@ function perform(elem, movie_id, movie_title, movie_title_orig, is_tv, is_movie,
         // For TV Series show only on TV links. TV Special, TV Movie, Episode & Documentary are treated as TV and Movie.
         if ((Boolean(site['TV']) == is_tv || Boolean(site['both'])) || (!is_tv && !is_movie) || getPageSetting('ignore_type')) {
           site = await replaceSearchUrlParams(site, movie_id, movie_title, movie_title_orig, movie_year, series_id, season_id, episode_id);
+          if (rowControls.cancelled()) { return; }
           if (getPageSetting('call_http_mod')) {
             maybeAddLink(elem, site, scout_tick);
           } else {
@@ -7788,7 +7694,7 @@ function perform(elem, movie_id, movie_title, movie_title_orig, is_tv, is_movie,
     }
   });
 
-  if (!site_shown) {
+  if (!site_shown && !rowControls.cancelled()) {
     $(elem).append("<pre>No sites enabled!\nScript's settings can be found in your Monkey's shortcut.\nFor now you can press this temporary button:");
     var p = $('<p />').attr('id', 'imdbscout_settings_button');
         p.append($('<button>Load Settings</button>').css({'cursor':'pointer', 'background-color':'#F5C518', 'color':'blue', 'font-weight':'bold'}).click(function() {
@@ -7997,63 +7903,119 @@ function getIconsLinkArea() {
 //==============================================================================
 
 function performSearch() {
-  // showsites is just for adjusting rate to imdb
-  const showsites1 = public_sites.concat(private_sites, chinese_sites, french_sites, german_sites, usenet_sites).reduce(function (n, site) {return n + (site['show'] == true); }, 0);
-  const showsites2 = (GM_config.get('load_second_bar_search')) ? subs_sites.concat(pre_databases, other_sites).reduce(function (n, site) {return n + (site['show'] == true); }, 0) : 0;
-  const showsites3 = (GM_config.get('load_third_bar_search' )) ? custom_sites.concat(streaming_sites).reduce(function (n, site) {return n + (site['show'] == true); }, 0) : 0;
-  var showsites  = showsites1 + showsites2 + showsites3
-
-  // main list elements, pages to test:
-  // https://www.imdb.com/search/title/?title=terminator
-  // https://www.imdb.com/list/ls057577566
-  // https://www.imdb.com/user/ur22654354/watchlist
-  // https://www.imdb.com/user/ur20552756/ratings
-  if($('.ipc-metadata-list').length && $('.ipc-metadata-list-summary-item').children().length !== 0) {
-    $('.ipc-metadata-list-summary-item').each(function() {
-      processListElement($(this), showsites);
-    });
-
-    // MutationObserver callback // Because 25+/50+ '.ipc-metadata-list-summary-item' elems are dynamically loaded
-    var observerCallback = function(mutationsList, observer) {
-      mutationsList.forEach(function(mutation) {
-        if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
-          $(mutation.addedNodes).each(function() {
-            // Only process if the added node is a new '.ipc-metadata-list-summary-item' element
-            if ($(this).hasClass('ipc-metadata-list-summary-item')) {
-              processListElement($(this), showsites);
-            }
-          });
-        }
-      });
-    };
-
-    var targetNode = document.querySelector('.ipc-metadata-list'); // Select the parent node of '.ipc-metadata-list-summary-item' to observe
-    var observerOptions = {childList: true, subtree: true};        // Observer options
-    var observer = new MutationObserver(observerCallback);         // Create a MutationObserver instance
-    observer.observe(targetNode, observerOptions);                 // Start observing
-  } else {
-    console.log("❌ IMDb Scout Mod (Lists): Element not found! Please report it.");
-    GM.notification("Element not found! Please report it.", "IMDb Scout Mod (Lists)");
+  if (listSearchStarted) { return; }
+  const target = document.querySelector('.ipc-metadata-list');
+  if (!target) {
+    console.log('❌ IMDb Scout Mod (Lists): Element not found! Please report it.');
+    GM.notification('Element not found! Please report it.', 'IMDb Scout Mod (Lists)');
+    return;
   }
+  listSearchStarted = true;
+
+  const showsites1 = public_sites.concat(private_sites, chinese_sites, french_sites, german_sites, usenet_sites).filter(site => site.show).length;
+  const showsites2 = GM_config.get('load_second_bar_search') ? subs_sites.concat(pre_databases, other_sites).filter(site => site.show).length : 0;
+  const showsites3 = GM_config.get('load_third_bar_search') ? custom_sites.concat(streaming_sites).filter(site => site.show).length : 0;
+  const showsites = showsites1 + showsites2 + showsites3;
+  let visibilityObserver;
+
+  function forgetRow(row) {
+    const state = listRowStates.get(row);
+    if (!state) { return; }
+    listRowStates.delete(row);
+    visibilityObserver?.unobserve(row);
+    if (state.tick && state.parent) {
+      const tick = state.tick;
+      state.parent.querySelectorAll('.result_box_' + tick + ', .result_box_2nd_' + tick + ', .result_box_3rd_' + tick)
+        .forEach(output => output.remove());
+    }
+  }
+
+  function forgetDisconnectedTree(node) {
+    if (node.nodeType !== 1) { return; }
+    if (node.matches('.ipc-metadata-list-summary-item') && !node.isConnected) { forgetRow(node); }
+    node.querySelectorAll('.ipc-metadata-list-summary-item').forEach(function(row) {
+      if (!row.isConnected) { forgetRow(row); }
+    });
+  }
+
+  function registerRow(row) {
+    const href = row.querySelector('.ipc-poster > a')?.getAttribute('href') || '';
+    const movieId = href.match(/tt(\d+)/)?.[1] || null;
+    const previous = listRowStates.get(row);
+    if (!previous || previous.movieId !== movieId) {
+      if (previous) { forgetRow(row); }
+      const bounds = previous ? row.getBoundingClientRect() : null;
+      listRowStates.set(row, {
+        movieId: movieId,
+        nearVisible: !visibilityObserver || Boolean(bounds && bounds.bottom >= -600 && bounds.top <= window.innerHeight + 600),
+        admitted: false,
+        parent: row.parentElement,
+        tick: null
+      });
+      visibilityObserver?.observe(row);
+    }
+    const state = listRowStates.get(row);
+    if (state.nearVisible && !state.admitted) {
+      processListElement($(row), showsites);
+    }
+  }
+
+  function registerTree(node) {
+    if (node.nodeType !== 1) { return; }
+    if (node.matches('.ipc-metadata-list-summary-item')) { registerRow(node); }
+    node.querySelectorAll('.ipc-metadata-list-summary-item').forEach(registerRow);
+    // IMDb sometimes inserts the poster link after inserting the row itself.
+    const owner = node.closest('.ipc-metadata-list-summary-item');
+    if (owner) { registerRow(owner); }
+  }
+
+  if (typeof IntersectionObserver === 'function') {
+    visibilityObserver = new IntersectionObserver(function(entries) {
+      for (const entry of entries) {
+        const state = listRowStates.get(entry.target);
+        if (!state) { continue; }
+        state.nearVisible = entry.isIntersecting;
+        if (state.nearVisible && !state.admitted) {
+          processListElement($(entry.target), showsites);
+        }
+      }
+      imdbRequestQueue.pump();
+      siteRequestQueue.pump();
+    }, { rootMargin: '600px 0px', threshold: 0 });
+  }
+  registerTree(target);
+
+  const mutationObserver = new MutationObserver(function(mutations) {
+    for (const mutation of mutations) {
+      mutation.removedNodes.forEach(forgetDisconnectedTree);
+      mutation.addedNodes.forEach(registerTree);
+      const owner = mutation.target.closest('.ipc-metadata-list-summary-item');
+      if (owner) { registerRow(owner); }
+    }
+    imdbRequestQueue.pump();
+    siteRequestQueue.pump();
+  });
+  // Observe the parent too, so replacing IMDb's list container does not lose
+  // lazy loading. Inspect descendant rows when a wrapper is appended.
+  mutationObserver.observe(target.parentElement || target, {
+    childList: true, subtree: true, attributes: true, attributeFilter: ['href']
+  });
+  window.addEventListener('pagehide', function(event) {
+    if (!event.persisted) {
+      visibilityObserver?.disconnect();
+      mutationObserver.disconnect();
+    }
+  });
 }
 
 function processListElement(element, showsites) {
-    if (!element.find('.ipc-poster>a').length) {
-      console.log("❌ IMDb Scout Mod (processListElement): Element not found! Please report it.");
-      GM.notification("Element not found! Please report it.", "IMDb Scout Mod (processListElement)");
-    }
-    const link     = element.find('.ipc-poster>a');
-    const movie_id = link.attr('href').match(/tt([0-9]*)\/?.*/)[1];
-
-    let scout_tick = window.localStorage['_imdbscoutmod_tick'];
-    if (!scout_tick) {
-      scout_tick = 1;
-      window.localStorage['_imdbscoutmod_tick'] = scout_tick;
-    }
-
-    performSearchSecondPart(element, link, movie_id, showsites, scout_tick);
-    scout_tick = parseInt(scout_tick) + 1;
-    window.localStorage['_imdbscoutmod_tick'] = scout_tick;
+  const row = element[0];
+  const link = element.find('.ipc-poster > a');
+  const movieId = (link.attr('href') || '').match(/tt(\d+)/)?.[1];
+  const state = listRowStates.get(row);
+  if (!movieId || !row.isConnected || state?.admitted) { return; }
+  if (state) { state.admitted = true; }
+  performSearchSecondPart(element, link, movieId, showsites);
 }
 
 function performSearchSecondPart(elem, link, movie_id, showsites, scout_tick) {
@@ -8076,24 +8038,9 @@ function performSearchSecondPart(elem, link, movie_id, showsites, scout_tick) {
   } else {
     rate = 800;
   }
-  var domain = "https://www.imdb.com";
-  var now    = (new Date())*1;
-  var lastLoaded = window.localStorage[domain+'_lastLoaded'];
-  if (!lastLoaded) {
-    lastLoaded = now - 8000;
-  } else {
-    lastLoaded = parseInt(lastLoaded);
-  }
-  if (now - lastLoaded < rate) {
-    window.setTimeout(performSearchSecondPart.bind(undefined, elem, link, movie_id, showsites, scout_tick), rate);
-    return;
-  } else {
-    window.localStorage[domain+'_lastLoaded'] = (new Date())*1;
-  }
-
   const query = { query: `query { title(id: "tt${movie_id}") { id titleText { text isOriginalTitle } originalTitleText { text } releaseYear { year } titleGenres { genres { genre { genreId } } } titleType { id } series { displayableEpisodeNumber { displayableSeason { text } episodeNumber { text } } series { id } } } }` };
 
-  GM.xmlHttpRequest({
+  imdbRequestQueue.enqueue({
     method: "POST",
     timeout: 10000,
     url:     "https://api.graphql.imdb.com",
@@ -8105,8 +8052,9 @@ function performSearchSecondPart(elem, link, movie_id, showsites, scout_tick) {
     },
     onload: function(response) {
       if (response.status == 200) {
-        const body = JSON.parse(response.responseText);
-        if ("errors" in body || "error" in body) {
+        let body;
+        try { body = JSON.parse(response.responseText); } catch (error) {}
+        if (!body || body.errors || body.error || !body.data?.title) {
           console.log("❌ IMDb Scout Mod (performSearchSecondPart): Error in response.");
           GM.notification("Error in response.", "IMDb Scout Mod (performSearchSecondPart)");
           return;
@@ -8160,6 +8108,20 @@ function performSearchSecondPart(elem, link, movie_id, showsites, scout_tick) {
     ontimeout: function() {
       console.log("❌ IMDb Scout Mod (performSearchSecondPart): Request timed out.");
       GM.notification("Request timed out.", "IMDb Scout Mod (performSearchSecondPart)");
+    }
+  }, {
+    ...listRowControls(elem),
+    interval: rate,
+    throttleKey: 'https://www.imdb.com_lastLoaded',
+    priority: function() {
+      const bounds = elem[0].getBoundingClientRect();
+      return bounds.bottom > 0 && bounds.top < window.innerHeight ? 0 : 1;
+    },
+    start: function() {
+      scout_tick = Number(window.localStorage['_imdbscoutmod_tick']) || 1;
+      window.localStorage['_imdbscoutmod_tick'] = scout_tick + 1;
+      const state = listRowStates.get(elem[0]);
+      if (state) { state.tick = scout_tick; }
     }
   });
 }
@@ -8539,14 +8501,12 @@ function iconSorterFound() {
   }
 
   for (const node of sorted) {
-    node.remove();
-    imdbscout_found.insertAdjacentHTML("beforeend", node.outerHTML + " ");
+    imdbscout_found.append(node, document.createTextNode(" "));
   }
 
   sortReqOnNewLineTemp && requests.length > 0 ? imdbscout_found.insertAdjacentHTML("beforeend", "</br>") : false;
   for (const node of requests) {
-    node.remove();
-    imdbscout_found.insertAdjacentHTML("beforeend", node.outerHTML + " ");
+    imdbscout_found.append(node, document.createTextNode(" "));
   }
   sortReqOnNewLineTemp && requests.length > 0 ? imdbscout_found.insertAdjacentHTML("beforeend", "</br>") : false;
 }
@@ -8594,8 +8554,7 @@ function iconSorterMissing() {
   let sorted = [...sorta(all)];
 
   for (const node of sorted) {
-    node.remove();
-    imdbscout_missing.insertAdjacentHTML("beforeend", node.outerHTML + " ");
+    imdbscout_missing.append(node, document.createTextNode(" "));
   }
 }
 
